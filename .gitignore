@@ -1,0 +1,10 @@
+# Claude Code local settings
+.claude/
+
+# Source archives
+*.zip
+
+# Loose DLLs/libs at repo root only (versioned OIDN_X.X_<os>/ folders are kept)
+/*.dll
+/*.so
+/*.dylib

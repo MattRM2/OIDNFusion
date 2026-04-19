@@ -1,0 +1,691 @@
+--[[
+----------------------------------------------------------------------
+Copyright (c) 2026, Matthieu Barbié
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+----------------------------------------------------------------------
+
+OIDN_Fusion.fuse — v1.0 (2026, Matthieu Barbié)
+Full rewrite from scratch.
+
+Key design decisions vs. previous implementations:
+  - CPU by default — avoids GPU driver crash on project open
+  - Selective DLL loading: only loads the DLLs for the selected device
+    (no mass-load of CUDA/HIP/SYCL at startup)
+  - ffi.cdef protected by pcall — safe against double-load on comp reopen
+  - No OIDN calls in NotifyChanged — deferred entirely to Process()
+  - Dynamic OIDN version detection: scans for OIDN_X.X_<os> folders,
+    allowing multiple installed versions side by side
+  - OIDN 3.0 scaffolding: temporal denoising inputs and branch wired in
+    but gated behind version detection (ETA H2 2026)
+
+OIDN 3.0 temporal denoising (planned, API not final as of 2026-04):
+  - Two modes: real-time (prev frame + backward motion vectors + depth)
+    and final-quality (adds future frames + forward motion vectors)
+  - Same "RT" filter with a temporal flag, or a new filter type — TBD
+  - Supersampling support also announced
+
+Changelog:
+  v1.0, 2026 — Initial release
+
+----------------------------------------------------------------------
+--]]
+
+local ffi = require("ffi")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Constants
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local FUSE_VERSION = 1.0
+
+-- OIDN device type enum (matches oidn.h)
+local OIDN_DEVICE = {
+    CPU  = 1,
+    SYCL = 2,
+    CUDA = 3,
+    HIP  = 4,
+    -- Metal (Apple Silicon) = 6 in OIDN 2.2+, kept separate for mac path
+}
+
+-- OIDN pixel format enum (matches oidn.h)
+local OIDN_FORMAT = {
+    FLOAT3 = 3,
+    HALF3  = 259,
+}
+
+-- OIDN quality enum (OIDN 2.3+, matches oidn.h)
+local OIDN_QUALITY = {
+    DEFAULT  = 0,
+    FAST     = 4,
+    BALANCED = 5,
+    HIGH     = 6,
+}
+
+-- UI combo index → OIDN device type (CPU is index 0 / default)
+local DEVICE_MAP = {
+    [0] = OIDN_DEVICE.CPU,
+    [1] = OIDN_DEVICE.CUDA,
+    [2] = OIDN_DEVICE.HIP,
+    [3] = OIDN_DEVICE.SYCL,
+}
+
+-- UI combo index → OIDN quality value
+local QUALITY_MAP = {
+    [0] = OIDN_QUALITY.DEFAULT,
+    [1] = OIDN_QUALITY.FAST,
+    [2] = OIDN_QUALITY.BALANCED,
+    [3] = OIDN_QUALITY.HIGH,
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Module state  (persists across Process() calls within a Fusion session)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local oidn_lib       = nil  -- loaded OIDN library handle
+local loaded_ver     = nil  -- version table that is currently loaded
+local loaded_device  = nil  -- OIDN device type currently loaded
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Script folder — captured once at load time
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local SCRIPT_FOLDER = (function()
+    local info = debug.getinfo(1, "S")
+    if not info or not info.source then return "." end
+    local path = info.source:sub(2)  -- strip leading "@"
+    local folder = path:gsub("\\", "/"):match("(.*/)") or "./"
+    return folder:sub(-1) == "/" and folder:sub(1, -2) or folder
+end)()
+
+-- OS folder suffix and main DLL name
+local OS_SUFFIX = ffi.os == "Windows" and "win"
+               or ffi.os == "OSX"     and "mac"
+               or                        "lin"
+
+local MAIN_DLL = ffi.os == "Windows" and "OpenImageDenoise.dll"
+              or ffi.os == "OSX"     and "libOpenImageDenoise.dylib"
+              or                        "libOpenImageDenoise.so"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Utilities
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function path_join(...)
+    local sep = package.config:sub(1, 1)
+    return table.concat({...}, sep)
+end
+
+local function file_exists(path)
+    local f = io.open(path, "rb")
+    if f then io.close(f) end
+    return f ~= nil
+end
+
+-- Attempts ffi.load; returns the library or nil on failure (no crash).
+local function try_load(path)
+    if not file_exists(path) then return nil end
+    local ok, result = pcall(ffi.load, path)
+    return ok and result or nil
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Version detection
+-- Scans for directories matching OIDN_X.X[.X]_<os> next to the fuse file.
+-- Falls back to probing a known list if the directory API is unavailable.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function detect_versions()
+    local versions  = {}
+    local pattern   = "^OIDN_(%d+)%.(%d+)[%d%.]*_" .. OS_SUFFIX .. "$"
+    local candidates = {}
+
+    -- Primary: bmd.readdir (available in Fusion / DaVinci Resolve)
+    if bmd and bmd.readdir then
+        local ok, entries = pcall(bmd.readdir, SCRIPT_FOLDER .. "/*")
+        if ok and entries then
+            for _, e in ipairs(entries) do
+                if e.IsDir then
+                    local maj, min = e.Name:match(pattern)
+                    if maj then
+                        table.insert(candidates, {
+                            name  = e.Name,
+                            major = tonumber(maj),
+                            minor = tonumber(min),
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    -- Fallback: probe well-known version slots
+    if #candidates == 0 then
+        for _, ver in ipairs({ "2.2", "2.3", "2.4", "3.0" }) do
+            local maj, min = ver:match("(%d+)%.(%d+)")
+            table.insert(candidates, {
+                name  = "OIDN_" .. ver .. "_" .. OS_SUFFIX,
+                major = tonumber(maj),
+                minor = tonumber(min),
+            })
+        end
+    end
+
+    -- Keep only candidates whose main DLL is actually present
+    for _, c in ipairs(candidates) do
+        local folder = path_join(SCRIPT_FOLDER, c.name)
+        if file_exists(path_join(folder, MAIN_DLL)) then
+            table.insert(versions, {
+                label  = "OIDN " .. c.major .. "." .. c.minor,
+                folder = folder,
+                major  = c.major,
+                minor  = c.minor,
+            })
+        end
+    end
+
+    -- Sort ascending so latest is last (selected by default)
+    table.sort(versions, function(a, b)
+        return a.major < b.major or (a.major == b.major and a.minor < b.minor)
+    end)
+
+    return versions
+end
+
+local oidn_versions = detect_versions()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FFI definitions
+-- pcall guard: ffi.cdef throws "attempt to redefine" on second call in the
+-- same LuaJIT state. Using pcall makes reloading the fuse safe.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function define_ffi()
+    pcall(ffi.cdef, [[
+        typedef void* OIDNDevice;
+        typedef void* OIDNBuffer;
+        typedef void* OIDNFilter;
+
+        OIDNDevice  oidnNewDevice      (int type);
+        void        oidnCommitDevice   (OIDNDevice device);
+        void        oidnReleaseDevice  (OIDNDevice device);
+        int         oidnGetDeviceError (OIDNDevice device, const char** outMessage);
+
+        OIDNBuffer  oidnNewBuffer      (OIDNDevice device, size_t byteSize);
+        void*       oidnGetBufferData  (OIDNBuffer buffer);
+        void        oidnReleaseBuffer  (OIDNBuffer buffer);
+
+        OIDNFilter  oidnNewFilter      (OIDNDevice device, const char* type);
+        void oidnSetFilterImage (OIDNFilter filter, const char* name,
+                                 OIDNBuffer buffer, int format,
+                                 size_t width, size_t height,
+                                 size_t byteOffset,
+                                 size_t pixelByteStride,
+                                 size_t rowByteStride);
+        void oidnSetFilterBool  (OIDNFilter filter, const char* name, bool  value);
+        void oidnSetFilterInt   (OIDNFilter filter, const char* name, int   value);
+        void oidnSetFilterFloat (OIDNFilter filter, const char* name, float value);
+        void oidnCommitFilter   (OIDNFilter filter);
+        void oidnExecuteFilter  (OIDNFilter filter);
+        void oidnReleaseFilter  (OIDNFilter filter);
+
+        int         oidnGetNumPhysicalDevices  ();
+        const char* oidnGetPhysicalDeviceString(int id, const char* name);
+        int         oidnGetPhysicalDeviceInt   (int id, const char* name);
+    ]])
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- DLL loading — selective per OS and device
+-- Only the DLLs required for the chosen device are loaded.
+-- This prevents GPU driver crashes when no compatible GPU is present.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function load_windows(folder, device)
+    -- Core runtime (required by all devices)
+    try_load(path_join(folder, "tbbbind_2_5.dll"))
+    try_load(path_join(folder, "tbbbind_2_0.dll"))
+    try_load(path_join(folder, "tbbbind.dll"))
+    try_load(path_join(folder, "tbb12.dll"))
+    try_load(path_join(folder, "OpenImageDenoise_core.dll"))
+
+    -- Device-specific only
+    if device == OIDN_DEVICE.SYCL then
+        try_load(path_join(folder, "sycl8.dll"))
+        try_load(path_join(folder, "ur_loader.dll"))
+        try_load(path_join(folder, "ur_win_proxy_loader.dll"))
+        try_load(path_join(folder, "ur_adapter_level_zero.dll"))
+        try_load(path_join(folder, "OpenImageDenoise_device_sycl.dll"))
+    elseif device == OIDN_DEVICE.CUDA then
+        try_load(path_join(folder, "OpenImageDenoise_device_cuda.dll"))
+    elseif device == OIDN_DEVICE.HIP then
+        try_load(path_join(folder, "OpenImageDenoise_device_hip.dll"))
+    else  -- CPU (default)
+        try_load(path_join(folder, "OpenImageDenoise_device_cpu.dll"))
+    end
+
+    return ffi.load(path_join(folder, "OpenImageDenoise.dll"))
+end
+
+local function load_mac(folder, device)
+    -- Extract version string from folder name (e.g. "2.4.0")
+    local ver = folder:match("OIDN_([%d%.]+)_mac") or "2.4.0"
+    try_load(path_join(folder, "libtbb.dylib"))
+    try_load(path_join(folder, "libOpenImageDenoise_core." .. ver .. ".dylib"))
+
+    -- Metal (device type 6) = Apple Silicon GPU, available since OIDN 2.2
+    if device == 6 then
+        try_load(path_join(folder, "libOpenImageDenoise_device_metal." .. ver .. ".dylib"))
+    else
+        try_load(path_join(folder, "libOpenImageDenoise_device_cpu." .. ver .. ".dylib"))
+    end
+
+    return ffi.load(path_join(folder, "libOpenImageDenoise.dylib"))
+end
+
+local function load_linux(folder, device, ver_str)
+    local v = ver_str or "2.4"
+    try_load(path_join(folder, "libtbb.so"))
+    try_load(path_join(folder, "libtbbbind.so.3"))
+    try_load(path_join(folder, "libOpenImageDenoise_core.so." .. v))
+
+    if device == OIDN_DEVICE.SYCL then
+        try_load(path_join(folder, "libsycl.so.7"))
+        try_load(path_join(folder, "libpi_level_zero.so"))
+        try_load(path_join(folder, "libOpenImageDenoise_device_sycl.so." .. v))
+    elseif device == OIDN_DEVICE.CUDA then
+        try_load(path_join(folder, "libOpenImageDenoise_device_cuda.so." .. v))
+    elseif device == OIDN_DEVICE.HIP then
+        try_load(path_join(folder, "libOpenImageDenoise_device_hip.so." .. v))
+    else
+        try_load(path_join(folder, "libOpenImageDenoise_device_cpu.so." .. v))
+    end
+
+    return ffi.load(path_join(folder, "libOpenImageDenoise.so"))
+end
+
+-- Returns (lib, err_string|nil).
+-- Library is cached: reloading a different version requires reopening the comp
+-- because LuaJIT cannot unload native libraries once loaded.
+local function ensure_library(ver_info, device)
+    if oidn_lib then
+        if loaded_ver == ver_info and loaded_device == device then
+            return oidn_lib, nil  -- already loaded, fast path
+        end
+        if loaded_ver ~= ver_info then
+            -- Version switch: warn, keep using the already-loaded lib
+            print("OIDN: version change requires reopening the composition.")
+            return oidn_lib, nil
+        end
+        -- Device switch: load additional device DLLs (additive, safe)
+    end
+
+    define_ffi()
+
+    local ver_str = ver_info.major .. "." .. ver_info.minor
+    local ok, result = pcall(function()
+        if ffi.os == "Windows" then
+            return load_windows(ver_info.folder, device)
+        elseif ffi.os == "OSX" then
+            return load_mac(ver_info.folder, device)
+        else
+            return load_linux(ver_info.folder, device, ver_str)
+        end
+    end)
+
+    if not ok then
+        return nil, "OIDN: failed to load library — " .. tostring(result)
+    end
+
+    oidn_lib      = result
+    loaded_ver    = ver_info
+    loaded_device = device
+    return oidn_lib, nil
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Fuse registration
+-- ─────────────────────────────────────────────────────────────────────────────
+
+FuRegisterClass("OIDN_Fusion", CT_Tool, {
+    REGS_Name            = "OIDN Denoiser",
+    REGS_OpIconString    = "OD",
+    REGS_Category        = "Color",
+    REGS_OpDescription   = "Intel OIDN denoiser — CPU/GPU, multi-version",
+    REGS_Company         = "Matthieu Barbié",
+    REG_Version          = FUSE_VERSION,
+    REG_Fuse_NoEdit      = false,
+    REG_NoPreCalcProcess = true,
+    REG_Fuse_NoReload    = false,
+    REG_SupportsDoD      = false,
+})
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Create()
+-- ─────────────────────────────────────────────────────────────────────────────
+
+function Create()
+    -- Version selector — populated from detected OIDN folders
+    local ver_opts = {
+        LINKID_DataType     = "Number",
+        INPID_InputControl  = "ComboControl",
+        INP_Default         = math.max(0, #oidn_versions - 1),  -- latest
+        INP_Integer         = true,
+        INP_DoNotifyChanged = true,
+    }
+    if #oidn_versions == 0 then
+        table.insert(ver_opts, { CCS_AddString = "No OIDN version found" })
+    else
+        for _, v in ipairs(oidn_versions) do
+            table.insert(ver_opts, { CCS_AddString = v.label })
+        end
+    end
+    InVersion = self:AddInput("OIDN Version", "OIDNVersion", ver_opts)
+
+    -- Device selector — CPU is index 0 / default
+    InDevice = self:AddInput("Device", "Device", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default        = 0,  -- CPU
+        INP_Integer        = true,
+        { CCS_AddString = "CPU" },
+        { CCS_AddString = "CUDA (Nvidia)" },
+        { CCS_AddString = "HIP (AMD)" },
+        { CCS_AddString = "SYCL (Intel)" },
+    })
+
+    InQuality = self:AddInput("Quality", "Quality", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default        = 0,  -- Default
+        { CCS_AddString = "Default" },
+        { CCS_AddString = "Fast" },
+        { CCS_AddString = "Balanced" },
+        { CCS_AddString = "High" },
+    })
+
+    InHDR = self:AddInput("HDR", "HDR", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer        = true,
+        INP_Default        = 1,  -- on by default for render outputs
+    })
+
+    InCleanAux = self:AddInput("Clean Aux", "CleanAux", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer        = true,
+        INP_Default        = 0,
+    })
+
+    -- ── OIDN 3.0 — temporal denoising (ETA H2 2026) ──────────────────────
+    -- Hidden until a 3.0+ version folder is selected.
+    -- Real-time mode: prev frame + backward motion vectors + depth.
+    -- Final-quality mode: adds future frames + forward motion vectors.
+    -- API not finalised — filter name and parameter names are stubs.
+    InTemporal = self:AddInput("Temporal Denoising  [OIDN 3.0+]", "Temporal", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer        = true,
+        INP_Default        = 0,
+        IC_Visible         = false,
+    })
+
+    self:AddInput(" ", "sep", {
+        INPID_InputControl = "SeparatorControl",
+    })
+
+    self:AddInput(
+        "OIDN Denoiser  v" .. FUSE_VERSION .. "  —  Matthieu Barbié",
+        "AuthorLabel",
+        {
+            LINKID_DataType    = "Text",
+            INPID_InputControl = "LabelControl",
+            INP_External       = false,
+            INP_Passive        = true,
+        }
+    )
+
+    -- ── Image inputs ─────────────────────────────────────────────────────────
+    InColor = self:AddInput("Color", "Color", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 1,
+        INP_Required    = true,
+    })
+
+    InAlbedo = self:AddInput("Albedo", "Albedo", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 2,
+        INP_Required    = false,
+    })
+
+    InNormal = self:AddInput("Normal", "Normal", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 3,
+        INP_Required    = false,
+    })
+
+    -- OIDN 3.0 temporal inputs — hidden until 3.0 selected
+    InPrevColor = self:AddInput("Previous Frame  [3.0+]", "PrevColor", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 4,
+        INP_Required    = false,
+        IC_Visible      = false,
+    })
+
+    InMotionVec = self:AddInput("Motion Vectors  [3.0+]", "MotionVectors", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 5,
+        INP_Required    = false,
+        IC_Visible      = false,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main       = 1,
+    })
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NotifyChanged()
+-- UI-only reactions. No OIDN library calls here — avoids crash on project open.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+function NotifyChanged(inp, param, time)
+    if not inp or not param then return end
+
+    if inp == InVersion then
+        local idx     = math.floor(param.Value) + 1  -- 1-indexed
+        local ver     = oidn_versions[idx]
+        local is_v3   = ver and ver.major >= 3
+
+        -- Reveal / hide OIDN 3.0 controls
+        InTemporal:SetAttrs({ IC_Visible = is_v3 })
+        InPrevColor:SetAttrs({ IC_Visible = is_v3 })
+        InMotionVec:SetAttrs({ IC_Visible = is_v3 })
+
+        -- Warn if user tries to switch version mid-session
+        if oidn_lib and loaded_ver and loaded_ver ~= ver then
+            print("OIDN: version change takes effect after reopening the composition.")
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Process() helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function set_filter_image(lib, filter, name, buf, depth, w, h, px_stride, row_stride)
+    local fmt = depth == 8 and OIDN_FORMAT.FLOAT3 or OIDN_FORMAT.HALF3
+    lib.oidnSetFilterImage(filter, name, buf, fmt, w, h, 0, px_stride, row_stride)
+end
+
+-- Allocates an OIDN buffer, copies the Fusion image data into it.
+-- Returns: buf, total_bytes, pixel_byte_stride, row_byte_stride
+local function alloc_image_buffer(lib, device, image, w, h)
+    local bpc       = image.Depth == 8 and 4 or 2  -- bytes per channel (float32 or float16)
+    local num_bytes  = w * h * 4 * bpc              -- 4 channels (RGBA)
+    local px_stride  = 4 * bpc
+    local row_stride = w * px_stride
+
+    local buf  = lib.oidnNewBuffer(device, num_bytes)
+    local dst  = ffi.cast("uint8_t*", lib.oidnGetBufferData(buf))
+    local src  = ffi.cast("uint8_t**", image:GetScanLine())
+    ffi.copy(dst, src[0], num_bytes)
+
+    return buf, num_bytes, px_stride, row_stride
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Process()
+-- ─────────────────────────────────────────────────────────────────────────────
+
+function Process(req)
+    local color  = InColor:GetValue(req)
+    local output = Image({ IMG_Like = color })
+
+    -- Input must be float (Depth 7 = float16, 8 = float32)
+    if color.Depth <= 6 then
+        output:Fill(Pixel({ R = 1.0, G = 0.0, B = 0.0, A = 1.0 }))
+        OutImage:Set(req, output)
+        return
+    end
+
+    if req:IsPreCalc() then
+        OutImage:Set(req, output)
+        return
+    end
+
+    -- Resolve selected version
+    local ver_idx  = math.floor(InVersion:GetValue(req).Value) + 1
+    local ver_info = oidn_versions[ver_idx]
+    if not ver_info then
+        print("OIDN: no valid OIDN version found. Check that an OIDN_X.X_" ..
+              OS_SUFFIX .. " folder exists next to the fuse.")
+        OutImage:Set(req, output)
+        return
+    end
+
+    -- Resolve device
+    local dev_idx  = math.floor(InDevice:GetValue(req).Value)
+    local dev_type = DEVICE_MAP[dev_idx] or OIDN_DEVICE.CPU
+
+    -- Load library (lazy, cached per session)
+    local lib, err = ensure_library(ver_info, dev_type)
+    if not lib then
+        print(err or "OIDN: library load failed.")
+        OutImage:Set(req, output)
+        return
+    end
+
+    -- Quality: force Fast for interactive previews
+    local quality
+    if req:IsQuick() then
+        quality = OIDN_QUALITY.FAST
+    else
+        local q_idx = math.floor(InQuality:GetValue(req).Value)
+        quality = QUALITY_MAP[q_idx] or OIDN_QUALITY.DEFAULT
+    end
+
+    local w = color.DataWindow:Width()
+    local h = color.DataWindow:Height()
+
+    -- Create device and filter
+    local device = lib.oidnNewDevice(dev_type)
+    lib.oidnCommitDevice(device)
+
+    -- OIDN 3.0 temporal mode flag
+    local use_temporal = ver_info.major >= 3
+                      and InTemporal:GetValue(req).Value == 1
+
+    -- Filter type: "RT" for 2.x.
+    -- OIDN 3.0 may introduce a temporal flag or a new filter name — update here.
+    local filter = lib.oidnNewFilter(device, "RT")
+
+    -- Color buffer (also used as in-place output)
+    local colorBuf, colorBytes, colorPxStr, colorRowStr =
+        alloc_image_buffer(lib, device, color, w, h)
+    set_filter_image(lib, filter, "color", colorBuf, color.Depth, w, h,
+                     colorPxStr, colorRowStr)
+
+    -- Albedo (optional)
+    local albedo    = InAlbedo:GetValue(req)
+    local albedoBuf = nil
+    if albedo then
+        local buf, _, pxs, rows = alloc_image_buffer(lib, device, albedo, w, h)
+        albedoBuf = buf
+        set_filter_image(lib, filter, "albedo", buf, albedo.Depth, w, h, pxs, rows)
+    end
+
+    -- Normal (optional)
+    local normal    = InNormal:GetValue(req)
+    local normalBuf = nil
+    if normal then
+        local buf, _, pxs, rows = alloc_image_buffer(lib, device, normal, w, h)
+        normalBuf = buf
+        set_filter_image(lib, filter, "normal", buf, normal.Depth, w, h, pxs, rows)
+    end
+
+    -- ── OIDN 3.0 temporal inputs ─────────────────────────────────────────────
+    -- TODO when OIDN 3.0 API is final (H2 2026):
+    --   • Confirm filter name/flag for temporal mode
+    --   • Wire InPrevColor  → "prevColor"  buffer
+    --   • Wire InMotionVec  → "flow"        buffer (backward motion vectors)
+    --   • Optionally wire depth channel for better quality
+    --   • Add "prevAlbedo" / "prevNormal" if API supports it
+    if use_temporal then
+        print("OIDN 3.0 temporal denoising: not yet implemented (API pending).")
+    end
+
+    -- Output in-place on the color buffer
+    set_filter_image(lib, filter, "output", colorBuf, color.Depth, w, h,
+                     colorPxStr, colorRowStr)
+
+    -- Commit and execute
+    lib.oidnSetFilterInt  (filter, "quality",  quality)
+    lib.oidnSetFilterBool (filter, "cleanAux", InCleanAux:GetValue(req).Value == 1)
+    lib.oidnSetFilterBool (filter, "hdr",      InHDR:GetValue(req).Value == 1)
+    lib.oidnCommitFilter(filter)
+    lib.oidnExecuteFilter(filter)
+
+    -- Error check
+    local errmsg = ffi.new("const char*[1]")
+    local errcode = lib.oidnGetDeviceError(device, errmsg)
+    if errcode ~= 0 then
+        print("OIDN error [" .. errcode .. "]: " .. ffi.string(errmsg[0]))
+    end
+
+    -- Copy denoised result back to Fusion output image
+    local colorPtr  = ffi.cast("uint8_t*", lib.oidnGetBufferData(colorBuf))
+    local outLines  = ffi.cast("uint8_t**", output:GetScanLine())
+    ffi.copy(outLines[0], colorPtr, colorBytes)
+
+    -- Release OIDN objects (library handle stays loaded for the session)
+    lib.oidnReleaseBuffer(colorBuf)
+    if albedoBuf then lib.oidnReleaseBuffer(albedoBuf) end
+    if normalBuf then lib.oidnReleaseBuffer(normalBuf) end
+    lib.oidnReleaseFilter(filter)
+    lib.oidnReleaseDevice(device)
+
+    OutImage:Set(req, output)
+    collectgarbage()
+end
