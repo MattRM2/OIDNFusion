@@ -2,7 +2,6 @@
 
 A DaVinci Resolve / Fusion fuse that brings [Intel Open Image Denoise (OIDN) 2.4](https://www.openimagedenoise.org/) directly into your node graph. Denoise ray-traced renders with CPU or GPU, with full support for albedo and normal auxiliary passes.
 
-**v1.0 — Written by Matthieu Barbié**
 ---
 ![OIDN Denoiser in DaVinci Resolve](preview.png)
 ---
