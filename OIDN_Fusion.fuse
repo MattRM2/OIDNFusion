@@ -45,18 +45,20 @@ OIDN 3.0 temporal denoising (planned, API not final as of 2026-04):
   - Supersampling support also announced
 
 Changelog:
+  v2.0, 2026 — Add blend/mix parameter (0=original, 1=full denoise), float16 supported
   v1.0, 2026 — Initial release
 
 ----------------------------------------------------------------------
 --]]
 
 local ffi = require("ffi")
+local bit = require("bit")
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Constants
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local FUSE_VERSION = 1.0
+local FUSE_VERSION = 2.0
 
 -- OIDN device type enum (matches oidn.h)
 local OIDN_DEVICE = {
@@ -139,6 +141,46 @@ local function file_exists(path)
     local f = io.open(path, "rb")
     if f then io.close(f) end
     return f ~= nil
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Half-float ↔ float32 conversion helpers (used for blend on Depth-7 images)
+-- Pre-allocated buffers avoid per-call GC pressure inside pixel loops.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local _f32buf = ffi.new("float[1]")
+local _u32buf = ffi.new("uint32_t[1]")
+
+-- IEEE 754 half-float → float32
+local function h2f(h)
+    local s = bit.band(bit.rshift(h, 15), 1)
+    local e = bit.band(bit.rshift(h, 10), 0x1F)
+    local m = bit.band(h, 0x3FF)
+    local bits
+    if e == 0 then
+        bits = bit.lshift(s, 31)                                    -- zero / subnormal → zero
+    elseif e == 31 then
+        bits = bit.bor(bit.lshift(s, 31), 0x7F800000,
+                       bit.lshift(m, 13))                           -- inf / NaN passthrough
+    else
+        bits = bit.bor(bit.lshift(s, 31),
+                       bit.lshift(e + 112, 23),                     -- rebias exponent 15→127
+                       bit.lshift(m, 13))
+    end
+    _u32buf[0] = bit.tobit(bits)
+    return ffi.cast("float*", _u32buf)[0]
+end
+
+-- float32 → IEEE 754 half-float (round-toward-zero, clamps to ±inf on overflow)
+local function f2h(f)
+    _f32buf[0] = f
+    local bits = ffi.cast("uint32_t*", _f32buf)[0]
+    local s = bit.rshift(bit.band(bits, 0x80000000), 16)
+    local e = bit.rshift(bit.band(bits, 0x7F800000), 23) - 112     -- rebias 127→15
+    local m = bit.rshift(bit.band(bits, 0x007FFFFF), 13)
+    if e <= 0  then return s end                                    -- underflow → ±zero
+    if e >= 31 then return bit.bor(s, 0x7C00) end                  -- overflow  → ±inf
+    return bit.bor(s, bit.lshift(e, 10), m)
 end
 
 -- Attempts ffi.load; returns the library or nil on failure (no crash).
@@ -437,6 +479,16 @@ function Create()
         INP_Default        = 0,
     })
 
+    InBlend = self:AddInput("Denoise Blend", "DenoiseBlend", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default        = 1.0,
+        INP_MinScale       = 0.0,
+        INP_MaxScale       = 1.0,
+        INP_MinAllowed     = 0.0,
+        INP_MaxAllowed     = 1.0,
+    })
+
     -- ── OIDN 3.0 — temporal denoising (ETA H2 2026) ──────────────────────
     -- Hidden until a 3.0+ version folder is selected.
     -- Real-time mode: prev frame + backward motion vectors + depth.
@@ -575,6 +627,20 @@ function Process(req)
         return
     end
 
+    -- Fast path: blend=0 → pure original, skip denoiser entirely
+    local blend = InBlend:GetValue(req).Value
+    if blend <= 0.0 then
+        local bpc       = color.Depth == 8 and 4 or 2
+        local w0        = color.DataWindow:Width()
+        local h0        = color.DataWindow:Height()
+        local num_bytes = w0 * h0 * 4 * bpc
+        ffi.copy(ffi.cast("uint8_t**", output:GetScanLine())[0],
+                 ffi.cast("uint8_t**", color:GetScanLine())[0],
+                 num_bytes)
+        OutImage:Set(req, output)
+        return
+    end
+
     -- Resolve selected version
     local ver_idx  = math.floor(InVersion:GetValue(req).Value) + 1
     local ver_info = oidn_versions[ver_idx]
@@ -676,6 +742,27 @@ function Process(req)
 
     -- Copy denoised result back to Fusion output image
     local colorPtr  = ffi.cast("uint8_t*", lib.oidnGetBufferData(colorBuf))
+
+    -- ── Blend: mix denoised with original (0=original, 1=full denoise) ────────
+    if blend < 1.0 then
+        local count  = w * h * 4  -- RGBA channels
+        local origSrc = ffi.cast("uint8_t**", color:GetScanLine())[0]
+        local inv = 1.0 - blend
+        if color.Depth == 8 then  -- float32: 4 bytes per channel
+            local dn  = ffi.cast("float*", colorPtr)
+            local org = ffi.cast("float*", origSrc)
+            for i = 0, count - 1 do
+                dn[i] = dn[i] * blend + org[i] * inv
+            end
+        else  -- float16 (Depth 7): 2 bytes per channel
+            local dn  = ffi.cast("uint16_t*", colorPtr)
+            local org = ffi.cast("uint16_t*", origSrc)
+            for i = 0, count - 1 do
+                dn[i] = f2h(h2f(dn[i]) * blend + h2f(org[i]) * inv)
+            end
+        end
+    end
+
     local outLines  = ffi.cast("uint8_t**", output:GetScanLine())
     ffi.copy(outLines[0], colorPtr, colorBytes)
 
