@@ -15,6 +15,7 @@ A DaVinci Resolve / Fusion fuse that brings [Intel Open Image Denoise (OIDN) 2.4
 - **Auxiliary passes** — Albedo and Normal inputs for improved denoising quality
 - **HDR** — on by default, suitable for linear light render outputs
 - **Clean Aux** — for pre-denoised auxiliary passes
+- **Denoise Blend** — mix slider (0 = original untouched, 1 = full denoise). At 0 the denoiser is skipped entirely for zero overhead
 - **Multi-layer EXR support** — connect a single multi-layer EXR to all inputs and use the node's Layer remapping in Settings (no Swizzle nodes needed)
 - **OIDN 3.0 ready** — temporal denoising inputs (Previous Frame, Motion Vectors) are scaffolded and will activate automatically when an `OIDN_3.0_win/` folder is detected
 
@@ -121,6 +122,7 @@ DaVinci Resolve extracts and routes each layer before passing it to the tool —
 | **Quality** | Default · Fast · Balanced · High. Fast is used automatically during interactive previews. |
 | **HDR** | Keep enabled for linear light render outputs (EXR). |
 | **Clean Aux** | Enable if your albedo/normal passes are already noise-free. |
+| **Denoise Blend** | 0 = original (denoiser skipped), 1 = full denoise, in-between = linear mix. Float16 fully supported. |
 
 ---
 
