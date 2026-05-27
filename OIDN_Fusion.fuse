@@ -149,6 +149,48 @@ local function try_load(path)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Half ↔ float32 helpers (used only when Blend mixes against a float16 input).
+-- Subnormals (|x| < 6.1e-5) flush to zero — fine for image data.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local bit     = require("bit")
+local bitcast = ffi.new("union { uint32_t u; float f; }[1]")
+
+local function half_to_float(h)
+    local s = bit.band(h, 0x8000)
+    local e = bit.band(h, 0x7c00)
+    local m = bit.band(h, 0x03ff)
+    if e == 0 then
+        bitcast[0].u = bit.lshift(s, 16)                 -- ±0 / subnormal → ±0
+    elseif e == 0x7c00 then
+        bitcast[0].u = bit.bor(bit.lshift(s, 16), 0x7f800000, bit.lshift(m, 13))
+    else
+        local exp_out = bit.rshift(e, 10) + 112          -- bias 15 → 127
+        bitcast[0].u = bit.bor(bit.lshift(s, 16),
+                               bit.lshift(exp_out, 23),
+                               bit.lshift(m, 13))
+    end
+    return bitcast[0].f
+end
+
+local function float_to_half(f)
+    bitcast[0].f = f
+    local u = bitcast[0].u
+    local s = bit.rshift(bit.band(u, 0x80000000), 16)
+    local e = bit.band(u, 0x7f800000)
+    local m = bit.band(u, 0x007fffff)
+    if e >= 0x47800000 then
+        if e == 0x7f800000 and m ~= 0 then return bit.bor(s, 0x7e00) end  -- NaN
+        return bit.bor(s, 0x7c00)                                          -- ±Inf / clamp
+    elseif e <= 0x38000000 then
+        return s                                                           -- underflow → ±0
+    end
+    return bit.bor(s,
+                   bit.lshift(bit.rshift(e, 23) - 112, 10),
+                   bit.rshift(m, 13))
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Version detection
 -- Scans for directories matching OIDN_X.X[.X]_<os> next to the fuse file.
 -- Falls back to probing a known list if the directory API is unavailable.
@@ -437,6 +479,18 @@ function Create()
         INP_Default        = 0,
     })
 
+    -- Mix between original (0.0) and fully denoised (1.0).
+    -- At 0.0 the entire OIDN pipeline is bypassed — zero-cost passthrough.
+    InBlend = self:AddInput("Blend", "Blend", {
+        LINKID_DataType    = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale       = 0.0,
+        INP_MaxScale       = 1.0,
+        INP_MinAllowed     = 0.0,
+        INP_MaxAllowed     = 1.0,
+        INP_Default        = 1.0,
+    })
+
     -- ── OIDN 3.0 — temporal denoising (ETA H2 2026) ──────────────────────
     -- Hidden until a 3.0+ version folder is selected.
     -- Real-time mode: prev frame + backward motion vectors + depth.
@@ -560,15 +614,35 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 function Process(req)
-    local color  = InColor:GetValue(req)
-    local output = Image({ IMG_Like = color })
+    local color = InColor:GetValue(req)
 
     -- Input must be float (Depth 7 = float16, 8 = float32)
     if color.Depth <= 6 then
-        output:Fill(Pixel({ R = 1.0, G = 0.0, B = 0.0, A = 1.0 }))
-        OutImage:Set(req, output)
+        local errOut = Image({ IMG_Like = color })
+        errOut:Fill(Pixel({ R = 1.0, G = 0.0, B = 0.0, A = 1.0 }))
+        OutImage:Set(req, errOut)
         return
     end
+
+    -- Blend = 0  → bypass the entire pipeline (no DLL load, no alloc, no denoise).
+    -- Blend = 1  → full denoise (fast path, in-place when possible).
+    -- 0 < b < 1  → mix original × (1-b) + denoised × b, per pixel.
+    local blend = InBlend:GetValue(req).Value
+    if blend <= 0.0 then
+        OutImage:Set(req, color)
+        return
+    end
+    if blend > 1.0 then blend = 1.0 end
+
+    -- HDR forces float32 output (full precision over the HDR range),
+    -- mirroring how the denoise itself benefits from float precision.
+    local hdr       = InHDR:GetValue(req).Value == 1
+    local in_depth  = color.Depth
+    local out_depth = (hdr and in_depth < 8) and 8 or in_depth
+
+    local output = (in_depth == out_depth)
+        and Image({ IMG_Like = color })
+        or  Image({ IMG_Like = color, IMG_Depth = out_depth })
 
     if req:IsPreCalc() then
         OutImage:Set(req, output)
@@ -621,11 +695,26 @@ function Process(req)
     -- OIDN 3.0 may introduce a temporal flag or a new filter name — update here.
     local filter = lib.oidnNewFilter(device, "RT")
 
-    -- Color buffer (also used as in-place output)
-    local colorBuf, colorBytes, colorPxStr, colorRowStr =
+    -- Input color buffer (kept at input depth — preserves the original for blending)
+    local inBuf, inBytes, inPx, inRow =
         alloc_image_buffer(lib, device, color, w, h)
-    set_filter_image(lib, filter, "color", colorBuf, color.Depth, w, h,
-                     colorPxStr, colorRowStr)
+    set_filter_image(lib, filter, "color", inBuf, in_depth, w, h, inPx, inRow)
+
+    -- Output buffer: in-place on inBuf when blend=1 and no depth upgrade;
+    -- otherwise allocate a separate buffer (needed to preserve the original
+    -- for blending, or when OIDN must emit a different depth than it reads).
+    local can_in_place = (blend >= 1.0) and (in_depth == out_depth)
+    local outBuf, outBytes, outPx, outRow
+    if can_in_place then
+        outBuf, outBytes, outPx, outRow = inBuf, inBytes, inPx, inRow
+    else
+        local out_bpc = out_depth == 8 and 4 or 2
+        outBytes = w * h * 4 * out_bpc
+        outPx    = 4 * out_bpc
+        outRow   = w * outPx
+        outBuf   = lib.oidnNewBuffer(device, outBytes)
+    end
+    set_filter_image(lib, filter, "output", outBuf, out_depth, w, h, outPx, outRow)
 
     -- Albedo (optional)
     local albedo    = InAlbedo:GetValue(req)
@@ -656,14 +745,10 @@ function Process(req)
         print("OIDN 3.0 temporal denoising: not yet implemented (API pending).")
     end
 
-    -- Output in-place on the color buffer
-    set_filter_image(lib, filter, "output", colorBuf, color.Depth, w, h,
-                     colorPxStr, colorRowStr)
-
     -- Commit and execute
     lib.oidnSetFilterInt  (filter, "quality",  quality)
     lib.oidnSetFilterBool (filter, "cleanAux", InCleanAux:GetValue(req).Value == 1)
-    lib.oidnSetFilterBool (filter, "hdr",      InHDR:GetValue(req).Value == 1)
+    lib.oidnSetFilterBool (filter, "hdr",      hdr)
     lib.oidnCommitFilter(filter)
     lib.oidnExecuteFilter(filter)
 
@@ -674,13 +759,68 @@ function Process(req)
         print("OIDN error [" .. errcode .. "]: " .. ffi.string(errmsg[0]))
     end
 
-    -- Copy denoised result back to Fusion output image
-    local colorPtr  = ffi.cast("uint8_t*", lib.oidnGetBufferData(colorBuf))
-    local outLines  = ffi.cast("uint8_t**", output:GetScanLine())
-    ffi.copy(outLines[0], colorPtr, colorBytes)
+    -- ── Write result to Fusion output (with optional blend against original) ──
+    -- OIDN only touches RGB — alpha is always carried over from the original.
+    local outScan = ffi.cast("uint8_t**", output:GetScanLine())[0]
+    local count   = w * h * 4
+    local inv     = 1.0 - blend
+
+    if can_in_place then
+        -- Fast path: blend=1 and depths match. Single memcpy.
+        ffi.copy(outScan, lib.oidnGetBufferData(outBuf), outBytes)
+
+    elseif in_depth == 8 and out_depth == 8 then
+        -- Float32 blend (tight LuaJIT-friendly loop)
+        local origF = ffi.cast("float*", lib.oidnGetBufferData(inBuf))
+        local denF  = ffi.cast("float*", lib.oidnGetBufferData(outBuf))
+        local outF  = ffi.cast("float*", outScan)
+        for i = 0, count - 1, 4 do
+            outF[i]   = origF[i]   * inv + denF[i]   * blend
+            outF[i+1] = origF[i+1] * inv + denF[i+1] * blend
+            outF[i+2] = origF[i+2] * inv + denF[i+2] * blend
+            outF[i+3] = origF[i+3]
+        end
+
+    elseif in_depth == 7 and out_depth == 7 then
+        -- Half-in / half-out blend (HDR off, half input, blend < 1).
+        -- Convert each pair to float, lerp, convert back.
+        local origH = ffi.cast("uint16_t*", lib.oidnGetBufferData(inBuf))
+        local denH  = ffi.cast("uint16_t*", lib.oidnGetBufferData(outBuf))
+        local outH  = ffi.cast("uint16_t*", outScan)
+        for i = 0, count - 1, 4 do
+            local oR = half_to_float(origH[i])
+            local oG = half_to_float(origH[i+1])
+            local oB = half_to_float(origH[i+2])
+            local dR = half_to_float(denH[i])
+            local dG = half_to_float(denH[i+1])
+            local dB = half_to_float(denH[i+2])
+            outH[i]   = float_to_half(oR * inv + dR * blend)
+            outH[i+1] = float_to_half(oG * inv + dG * blend)
+            outH[i+2] = float_to_half(oB * inv + dB * blend)
+            outH[i+3] = origH[i+3]
+        end
+
+    else
+        -- in_depth=7, out_depth=8 (HDR upgrade with half input).
+        -- Original is half (lifted to float), denoised already float.
+        local origH = ffi.cast("uint16_t*", lib.oidnGetBufferData(inBuf))
+        local denF  = ffi.cast("float*",    lib.oidnGetBufferData(outBuf))
+        local outF  = ffi.cast("float*",    outScan)
+        for i = 0, count - 1, 4 do
+            local oR = half_to_float(origH[i])
+            local oG = half_to_float(origH[i+1])
+            local oB = half_to_float(origH[i+2])
+            local oA = half_to_float(origH[i+3])
+            outF[i]   = oR * inv + denF[i]   * blend
+            outF[i+1] = oG * inv + denF[i+1] * blend
+            outF[i+2] = oB * inv + denF[i+2] * blend
+            outF[i+3] = oA
+        end
+    end
 
     -- Release OIDN objects (library handle stays loaded for the session)
-    lib.oidnReleaseBuffer(colorBuf)
+    lib.oidnReleaseBuffer(inBuf)
+    if not can_in_place then lib.oidnReleaseBuffer(outBuf) end
     if albedoBuf then lib.oidnReleaseBuffer(albedoBuf) end
     if normalBuf then lib.oidnReleaseBuffer(normalBuf) end
     lib.oidnReleaseFilter(filter)
