@@ -419,6 +419,7 @@ FuRegisterClass("OIDN_Fusion", CT_Tool, {
     REG_NoPreCalcProcess = true,
     REG_Fuse_NoReload    = false,
     REG_SupportsDoD      = false,
+    REG_NoBlendCtrls     = true,   -- we supply our own DenoiseMix blend
 })
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -481,7 +482,8 @@ function Create()
 
     -- Mix between original (0.0) and fully denoised (1.0).
     -- At 0.0 the entire OIDN pipeline is bypassed — zero-cost passthrough.
-    InBlend = self:AddInput("Blend", "Blend", {
+    -- ID "DenoiseMix" avoids the Fusion-reserved "Blend" compositing control.
+    InBlend = self:AddInput("Blend", "DenoiseMix", {
         LINKID_DataType    = "Number",
         INPID_InputControl = "SliderControl",
         INP_MinScale       = 0.0,
@@ -628,11 +630,9 @@ function Process(req)
     -- Blend = 1  → full denoise (fast path, in-place when possible).
     -- 0 < b < 1  → mix original × (1-b) + denoised × b, per pixel.
     local blend = InBlend:GetValue(req).Value
-    if blend <= 0.0 then
-        OutImage:Set(req, color)
-        return
-    end
-    if blend > 1.0 then blend = 1.0 end
+    -- Clamp both ends: slider drag can produce 0.9999998 or 1.0000001.
+    if blend <= 1e-6  then OutImage:Set(req, color); return end
+    if blend >= 1.0 - 1e-6 then blend = 1.0 end
 
     -- HDR forces float32 output (full precision over the HDR range),
     -- mirroring how the denoise itself benefits from float precision.
