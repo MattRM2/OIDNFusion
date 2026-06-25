@@ -24,7 +24,7 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ----------------------------------------------------------------------
 
-OIDN_Fusion.fuse — v1.0 (2026, Matthieu Barbié)
+OIDN_Fusion.fuse — v1.1 (2026, Matthieu Barbié)
 Full rewrite from scratch.
 
 Key design decisions vs. previous implementations:
@@ -45,6 +45,7 @@ OIDN 3.0 temporal denoising (planned, API not final as of 2026-04):
   - Supersampling support also announced
 
 Changelog:
+  v1.1, 2026 — Fix Blend slider
   v1.0, 2026 — Initial release
 
 ----------------------------------------------------------------------
@@ -56,7 +57,7 @@ local ffi = require("ffi")
 -- Constants
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local FUSE_VERSION = 1.0
+local FUSE_VERSION = 1.1
 
 -- OIDN device type enum (matches oidn.h)
 local OIDN_DEVICE = {
